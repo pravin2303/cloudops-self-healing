@@ -1,0 +1,44 @@
+flowchart TB
+    subgraph GH["GitHub"]
+        Dev[Developer Push] --> GHA[GitHub Actions]
+    end
+
+    subgraph CICD["CI/CD Pipeline"]
+        GHA --> Test[Run Tests]
+        Test --> Build[Docker Build]
+        Build --> OIDC[Assume AWS Role via OIDC]
+        OIDC --> Push[Push Image to ECR]
+        Push --> Deploy[Trigger Instance Refresh]
+    end
+
+    subgraph AWS["AWS Cloud - VPC"]
+        subgraph Public["Public Subnets (2 AZs)"]
+            IGW[Internet Gateway]
+            ALB[Application Load Balancer]
+            NAT[NAT Gateway]
+        end
+
+        subgraph Private["Private Subnets (2 AZs)"]
+            subgraph ASG["Auto Scaling Group (min 2 / max 4)"]
+                EC2A[EC2 Instance - AZ1]
+                EC2B[EC2 Instance - AZ2]
+            end
+        end
+
+        ECR[Amazon ECR]
+        TG[Target Group]
+        CW[CloudWatch]
+    end
+
+    Internet((Users)) --> IGW --> ALB
+    ALB --> TG --> EC2A
+    TG --> EC2B
+    EC2A -.->|pulls image| ECR
+    EC2B -.->|pulls image| ECR
+    Push --> ECR
+    EC2A --> NAT --> IGW
+    EC2A --> CW
+    EC2B --> CW
+    ALB --> CW
+    CW -->|unhealthy| ASG
+    ASG -->|replace| EC2A

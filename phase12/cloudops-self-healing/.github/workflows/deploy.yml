@@ -1,0 +1,170 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ASG
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      previous_version: ${{ steps.previous.outputs.previous_version }}
+      new_version: ${{ steps.lt.outputs.new_version }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Compute image tag (same convention CI used)
+        id: meta
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: echo "image_tag=sha-${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC — no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Capture current default Launch Template version (for rollback)
+        id: previous
+        run: |
+          set -euo pipefail
+          PREV=$(aws ec2 describe-launch-templates \
+            --launch-template-ids "${{ vars.LAUNCH_TEMPLATE_ID }}" \
+            --query 'LaunchTemplates[0].DefaultVersionNumber' --output text)
+          echo "previous_version=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Current default version: $PREV"
+
+      - name: Fetch current user-data
+        run: |
+          set -euo pipefail
+          aws ec2 describe-launch-template-versions \
+            --launch-template-id "${{ vars.LAUNCH_TEMPLATE_ID }}" \
+            --versions '$Latest' \
+            --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+            --output text | base64 -d > current_user_data.sh
+
+          OLD_TAG=$(grep -oP '(?<=APP_VERSION=")[^"]+' current_user_data.sh | head -1)
+          echo "Detected currently-deployed tag: $OLD_TAG"
+          echo "OLD_TAG=$OLD_TAG" >> "$GITHUB_ENV"
+
+      - name: Patch in the new image tag and create a new Launch Template version
+        id: lt
+        run: |
+          set -euo pipefail
+          NEW_TAG="${{ steps.meta.outputs.image_tag }}"
+
+          sed "s/${OLD_TAG}/${NEW_TAG}/g" current_user_data.sh > new_user_data.sh
+          NEW_USER_DATA_B64=$(base64 -w0 new_user_data.sh)
+
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-id "${{ vars.LAUNCH_TEMPLATE_ID }}" \
+            --source-version '$Latest' \
+            --launch-template-data "{\"UserData\":\"${NEW_USER_DATA_B64}\"}" \
+            --query 'LaunchTemplateVersion.VersionNumber' --output text)
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+          aws ec2 modify-launch-template \
+            --launch-template-id "${{ vars.LAUNCH_TEMPLATE_ID }}" \
+            --default-version "$NEW_VERSION"
+
+          echo "New default Launch Template version: $NEW_VERSION (tag: $NEW_TAG)"
+
+      - name: Trigger Instance Refresh
+        id: refresh
+        run: |
+          set -euo pipefail
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ vars.ASG_NAME }}" \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 90}' \
+            --query 'InstanceRefreshId' --output text)
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+          echo "Started Instance Refresh: $REFRESH_ID"
+
+      - name: Wait for Instance Refresh to complete
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "${{ vars.ASG_NAME }}" \
+              --instance-refresh-ids "${{ steps.refresh.outputs.refresh_id }}" \
+              --query 'InstanceRefreshes[0].Status' --output text)
+            echo "[$i/40] Instance refresh status: $STATUS"
+            if [ "$STATUS" == "Successful" ]; then
+              exit 0
+            fi
+            if [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Cancelled" ]; then
+              echo "::error::Instance refresh ended with status $STATUS"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "::error::Timed out waiting for instance refresh to complete"
+          exit 1
+
+      - name: Verify the new version is actually serving traffic
+        run: |
+          set -euo pipefail
+          EXPECTED="${{ steps.meta.outputs.image_tag }}"
+          for i in $(seq 1 12); do
+            ACTUAL=$(curl -sf --max-time 5 "http://${{ vars.ALB_DNS_NAME }}/version" | jq -r '.version' 2>/dev/null || echo "")
+            echo "[$i/12] ALB reports version: '$ACTUAL' (expecting '$EXPECTED')"
+            if [ "$ACTUAL" == "$EXPECTED" ]; then
+              echo "Deployment verified — $EXPECTED is live."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Could not verify $EXPECTED is being served within the timeout."
+          exit 1
+
+      - name: Report success
+        run: |
+          {
+            echo "### Deployed :white_check_mark:"
+            echo "Tag \`${{ steps.meta.outputs.image_tag }}\` is live (Launch Template version ${{ steps.lt.outputs.new_version }})."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rollback:
+    name: Rollback on failed deployment
+    needs: deploy
+    if: failure() && needs.deploy.outputs.previous_version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Roll back Launch Template default version
+        run: |
+          set -euo pipefail
+          aws ec2 modify-launch-template \
+            --launch-template-id "${{ vars.LAUNCH_TEMPLATE_ID }}" \
+            --default-version "${{ needs.deploy.outputs.previous_version }}"
+
+      - name: Trigger Instance Refresh back to the previous version
+        run: |
+          set -euo pipefail
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ vars.ASG_NAME }}" \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 90}'
+
+      - name: Report rollback
+        run: |
+          {
+            echo "### Rolled back :leftwards_arrow_with_hook:"
+            echo "Deployment of \`${{ needs.deploy.outputs.image_tag }}\` failed. Reverted to Launch Template version ${{ needs.deploy.outputs.previous_version }}."
+          } >> "$GITHUB_STEP_SUMMARY"

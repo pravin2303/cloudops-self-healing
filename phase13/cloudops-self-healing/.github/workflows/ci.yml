@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/**"
+
+# Default to read-only; the build-and-push job elevates only what it
+# needs (id-token: write) for its own OIDC exchange.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: app/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  build-and-push:
+    name: Build & Push to ECR
+    needs: test
+    # Only push real images from commits actually on main — PRs get
+    # tested but never trigger a build/push.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required to request the OIDC token
+      contents: read
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: meta
+        run: echo "image_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC — no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        working-directory: app
+        run: |
+          docker build \
+            --build-arg APP_VERSION=${{ steps.meta.outputs.image_tag }} \
+            -t ${{ vars.ECR_REPOSITORY_URL }}:${{ steps.meta.outputs.image_tag }} .
+
+      - name: Push image to ECR
+        run: docker push ${{ vars.ECR_REPOSITORY_URL }}:${{ steps.meta.outputs.image_tag }}
+
+      - name: Summary
+        run: |
+          echo "### Image pushed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ vars.ECR_REPOSITORY_URL }}:${{ steps.meta.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Vulnerability scan results are available in the ECR console shortly after this push." >> "$GITHUB_STEP_SUMMARY"
