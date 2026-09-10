@@ -67,5 +67,5 @@ variable "instance_type" {
 variable "app_image_tag" {
   description = "Immutable ECR image tag to deploy. Must already exist in ECR (see Phase 5)."
   type        = string
-  default     = "v0.1.0"
+  default     = "phase5"
 }

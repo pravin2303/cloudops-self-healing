@@ -48,7 +48,7 @@ variable "app_port" {
 variable "root_volume_size_gb" {
   description = "Size of the encrypted root EBS volume, in GB."
   type        = number
-  default     = 8
+  default     = 30
 }
 
 variable "tags" {

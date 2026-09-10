@@ -58,6 +58,7 @@ module "compute" {
   image_tag                  = var.app_image_tag
   app_port                   = var.app_port
   log_group_name             = local.log_group_name
+  root_volume_size_gb        = var.root_volume_size_gb
 }
 
 module "autoscaling" {

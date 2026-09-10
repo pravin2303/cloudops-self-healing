@@ -8,7 +8,7 @@ set -euxo pipefail
 # Installs Docker, authenticates to ECR, and starts the app container
 # with its logs shipped directly to CloudWatch Logs.
 #
-# Values in ${...} below are interpolated by Terraform's templatefile()
+# Values in $${...} below are interpolated by Terraform's templatefile()
 # function at plan/apply time — they are NOT shell variables set at
 # runtime.
 # ---------------------------------------------------------------------------

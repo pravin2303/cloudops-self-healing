@@ -67,7 +67,7 @@ variable "instance_type" {
 variable "app_image_tag" {
   description = "Immutable ECR image tag to deploy. Must already exist in ECR (see Phase 5)."
   type        = string
-  default     = "v0.1.0"
+  default     = "phase5"
 }
 
 variable "min_size" {
@@ -110,4 +110,9 @@ variable "alert_email" {
   description = "Optional email address to receive CloudWatch alarm notifications."
   type        = string
   default     = ""
+}
+variable "root_volume_size_gb" {
+  description = "Root EBS volume size for EC2 instances."
+  type        = number
+  default     = 30
 }
